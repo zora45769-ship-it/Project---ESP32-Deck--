@@ -1,9 +1,9 @@
 /* ============================================================
-   ESP32 StreamDeck v4 — устойчивость к просадке питания:
-   - brownout-детектор отключён (плата не падает в ребут-цикл)
-   - CPU 80 МГц вместо 240 (меньше потребление)
-   - мощность BLE снижена с +9 до +3 дБм (пики передатчика ниже)
-   Библиотека: ESP32-BLE-Keyboard (T-vK), ядро ESP32 2.0.17
+   ESP32 StreamDeck v1 — resilience against power dips:
+   - Brownout detector disabled (prevents the board from entering a reboot loop)
+   - CPU set to 80 MHz instead of 240 MHz (reduces power consumption)
+   - BLE transmit power lowered from +9 dBm to +3 dBm (reduces transmitter power spikes)
+   Library: ESP32-BLE-Keyboard (T-vK), ESP32 core 2.0.17
    ============================================================ */
 #include <BleKeyboard.h>
 #include <Preferences.h>
