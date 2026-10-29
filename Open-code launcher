@@ -1,0 +1,2339 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""StreamDeck Launcher v1 — ESP32 StreamDeck + OBS + applications + RU/EN.
+
+The interface language can be toggled in the top-right corner (RU / EN) and is
+saved to the configuration file. Actions are stored in the config as codes,
+making the configuration language-agnostic; legacy Russian-based values ​​are
+automatically recognized.
+
+Connection: A dedicated worker thread manages the port and automatically
+handles reconnections (up to 6 attempts). A "watcher" intervenes only if the
+thread terminates. Connection-related events are logged to `launcher_error.log`
+with the `[connect]` tag.
+
+Addictions:  pip install customtkinter pyserial obsws-python pynput psutil pygetwindow pycaw comtypes
+Assembly EXE:   pyinstaller --onefile --noconsole --collect-all customtkinter --collect-all pynput --collect-all pycaw --name StreamDeckLauncher streamdeck_launcher.py
+"""
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+from copy import deepcopy
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    import customtkinter as ctk
+except ImportError as e:
+    print(f"Не хватает библиотек: {e}")
+    print("Установите:  pip install customtkinter pyserial obsws-python")
+    sys.exit(1)
+
+try:
+    import serial
+    import serial.tools.list_ports as list_ports
+except ImportError:
+    serial = None
+
+try:
+    import obsws_python as obs
+except ImportError:
+    obs = None
+
+try:
+    from pynput.keyboard import Controller as _KbController, Key as _PKey
+    HAS_PYNPUT = True
+except ImportError:
+    HAS_PYNPUT = False
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import pygetwindow as gw
+    HAS_GW = True
+except ImportError:
+    HAS_GW = False
+
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    HAS_PYCAW = True
+except Exception:
+    HAS_PYCAW = False
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "streamdeck_config.json")
+ERROR_LOG = os.path.join(BASE_DIR, "launcher_error.log")
+
+
+def _write_crash_log(text):
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("\n===== %Y-%m-%d %H:%M:%S =====\n") + text)
+    except Exception:
+        pass
+
+
+def _excepthook(tp, val, tb):
+    _write_crash_log("".join(traceback.format_exception(tp, val, tb)))
+    sys.__excepthook__(tp, val, tb)
+
+
+def _threading_excepthook(args):
+    _write_crash_log("[поток]\n" +
+                     "".join(traceback.format_exception(
+                         args.exc_type, args.exc_value, args.exc_traceback)))
+
+
+sys.excepthook = _excepthook
+threading.excepthook = _threading_excepthook
+
+# ==================================================================
+# Переводы
+# ==================================================================
+STR = {
+    "ru": {
+        "title": "StreamDeck Launcher — ESP32 + OBS + приложения",
+        "lang": "Язык:",
+        "port": "Порт ESP32:",
+        "refresh": "Обновить",
+        "connect": "Подключить",
+        "find": "Найти ESP32",
+        "disconnect": "Отключить",
+        "ser_nc": "Serial: не подключён",
+        "ser_try": "Serial: подключение...",
+        "ser_retry": "Serial: переподключение...",
+        "ser_ok": "Serial: подключён ({p})",
+        "obs_title": "OBS WebSocket:",
+        "obs_connect": "Подключить OBS",
+        "obs_nc": "OBS: не подключён",
+        "obs_ok": "OBS: подключён",
+        "slots": "Слоты",
+        "search": "Поиск слота...",
+        "profile": "Профиль:",
+        "sw_auto": "Автоподключение (watcher)",
+        "sw_test": "Тест-режим (нажатия без действий)",
+        "sw_bt": "Bluetooth-режим (OBS через запасные клавиши)",
+        "imp": "Импорт",
+        "exp": "Экспорт",
+        "stats": "Статистика",
+        "push": "Записать в ESP32",
+        "pushing": "Запись...",
+        "read": "Прочитать",
+        "reset": "Сбросить",
+        "log": "Журнал:",
+        "copy": "Копировать",
+        "paste": "Вставить",
+        "name_lbl": "Своё имя:",
+        "ble_on": "BLE: подключён",
+        "ble_wait": "BLE: ожидание",
+        "keys_note": "Клавиши отправит сама ESP32 — работает и без лаунчера.",
+        "media_note": "Медиа-клавишу отправит ESP32 — работает и без лаунчера.",
+        "obs_test": "Проверить действие",
+        "bt_hint": "Запишется как запасная клавиша — привяжите её в горячих клавишах OBS",
+        "macro_hint": "Шаги через | — клавиши как в «Клавиши» (CTRL+C), пауза: 300ms или WAIT 300",
+        "macro_run": "Выполнить макрос",
+        "cmd_lbl": "Команда Windows (как в «Выполнить»):",
+        "cmd_run": "Запустить",
+        "text_lbl": "Текст для вставки (Ctrl+V):",
+        "text_note": "Текст кладётся в буфер обмена и вставляется Ctrl+V — кириллица не ломается.",
+        "app_lbl": "Приложение:",
+        "app_path": "Путь к exe (можно свой):",
+        "app_args": "Аргументы запуска:",
+        "app_test": "Проверить",
+        "http_lbl": "Вебхук / API-запрос:",
+        "http_body": "Тело запроса (для POST, JSON):",
+        "http_send": "Отправить запрос",
+        "vol_pycaw": "Системная громкость через pycaw.",
+        "vol_no": "pycaw не установлен — медиа-клавиши. pip install pycaw comtypes",
+        "none_note": "Выберите тип действия сверху — конфиг запишется на ESP32 по кнопке «Записать в ESP32».",
+        "unassigned": "не назначено",
+        "p_macro": "Макрос: ",
+        "p_cmd": "Команда: ",
+        "p_text": "Текст: ",
+        "p_app": "Приложение: ",
+        "p_obs": "OBS: ",
+        "p_vol": "Громкость: ",
+        "p_http": "HTTP: ",
+        "empty": " (пусто)",
+        "warn_port": "Выберите COM-порт.",
+        "err_find": "Подходящий COM-порт не найден.\nПроверьте: плата вставлена? Драйвер CH340 жив? Serial Monitor закрыт?",
+        "warn_conn_first": "Сначала подключитесь к ESP32.",
+        "log_connected": "Подключено: {p}",
+        "log_lost": "Связь оборвалась, пробую снова — {e}",
+        "log_watch": "Watcher: подключаю {p}",
+        "serial_dead": "{p}: порт недоступен (6 попыток)",
+        "push_ok": "Конфигурация записана в ESP32 (APPLY подтверждён)",
+        "apply_err": "APPLY не подтверждён платой.",
+        "slot_ack": "Слот {s}: нет подтверждения",
+        "slot_err": "Слот {s}: {e}",
+        "port_closed": "Порт закрылся: {e}",
+        "list_hdr": "--- Слоты на плате ---",
+        "list_fail": "ESP32 не ответил на LIST",
+        "reset_q": "Стереть настройки на ESP32?",
+        "reset_ok": "Настройки на ESP32 сброшены",
+        "obs_lib": "Не установлен obsws-python.\npip install obsws-python",
+        "obs_fail": "Не удалось подключиться:\n{e}\n\nВключите WebSocket-сервер в OBS: Инструменты → Настройки WebSocket-сервера.",
+        "obs_log": "OBS подключён: {s} сцен, {i} источников",
+        "warn_obs_first": "Сначала подключитесь к OBS.",
+        "stats_empty": "Статистика пуста — нажмите что-нибудь на дэке",
+        "stats_hdr": "--- Топ нажатий ---",
+        "prof_saved": "Профиль сохранён: {n}",
+        "prof_loaded": "Профиль загружен: {n}",
+        "prof_load_msg": "Профиль «{n}» загружен.\nНажмите «Записать в ESP32», чтобы применить его на плате.",
+        "prof_del_q": "Удалить профиль «{n}»?",
+        "prof_deleted": "Профиль удалён: {n}",
+        "prof_none": "Профиль не выбран.",
+        "prof_name_q": "Название профиля:",
+        "prof_new_t": "Новый профиль",
+        "exp_ok": "Конфиг экспортирован: {p}",
+        "exp_fail": "Не удалось сохранить:\n{e}",
+        "imp_fail": "Не удалось прочитать:\n{e}",
+        "imp_ok": "Конфиг загружен.\nНажмите «Записать в ESP32», чтобы применить его на плате.",
+        "imp_log": "Конфиг импортирован: {p}",
+        "cfg_fail": "Не удалось сохранить конфиг: {e}",
+        "copied": "Слот скопирован: {s}",
+        "pasted": "Слот вставлен: {s}",
+        "macro_empty_q": "Макрос пустой.",
+        "macro_bad": "Макрос: не понял шаги — {e}",
+        "no_pynput": "Не установлен pynput — pip install pynput",
+        "macro_err": "Макрос: ошибка — {e}",
+        "clip_err": "Буфер обмена: {e}",
+        "paste_err": "Вставка: {e}",
+        "cmd_ok": "Команда запущена: {c}",
+        "cmd_err": "Команда: ошибка — {e}",
+        "closed_n": "Закрыто процессов: {n}",
+        "not_found": "Процесс не найден",
+        "focus_ok": "Фокус на окно",
+        "focus_retry": "Окно не найдено — запускаю заново",
+        "path_missing": "Путь к приложению не указан",
+        "run_ok": "Запуск: {p}",
+        "run_err": "Запуск: ошибка — {e}",
+        "gw_missing": "pygetwindow не установлен — pip install pygetwindow",
+        "focus_err": "Фокус: ошибка — {e}",
+        "http_ok": "HTTP {m}: ответ {c}",
+        "http_code": "HTTP: сервер ответил {c}",
+        "http_err": "HTTP: ошибка — {e}",
+        "vol_log": "Громкость: {r}",
+        "test_log": "ТЕСТ: {s}",
+        "app_path_q": "Укажите путь к exe.",
+        "url_q": "Укажите URL.",
+        "push_msg_hdr": "Конфигурация записана в ESP32.\n\nВ OBS: Настройки → Горячие клавиши, назначьте:\n",
+        "push_msg_tip": "\n\nСовет: кликните в поле горячей клавиши OBS и нажмите кнопку на стримдэке — комбинация подставится сама.",
+        "push_done": "Конфигурация записана в ESP32.",
+        "done": "Готово",
+        "obs_err_log": "OBS: ошибка — {e}",
+        "err_serial": "Serial",
+        "err_find_t": "Поиск",
+        "err_esp32": "ESP32",
+        "obs_t": "OBS",
+        "macro_t": "Макрос",
+        "cmd_t": "Команда",
+        "text_t": "Текст",
+        "app_t": "Приложение",
+        "http_t": "HTTP",
+        "profile_t": "Профиль",
+        "exp_t": "Экспорт",
+        "imp_t": "Импорт",
+        "reset_t": "Сброс",
+    },
+    "en": {
+        "title": "StreamDeck Launcher — ESP32 + OBS + apps",
+        "lang": "Language:",
+        "port": "ESP32 port:",
+        "refresh": "Refresh",
+        "connect": "Connect",
+        "find": "Find ESP32",
+        "disconnect": "Disconnect",
+        "ser_nc": "Serial: not connected",
+        "ser_try": "Serial: connecting...",
+        "ser_retry": "Serial: reconnecting...",
+        "ser_ok": "Serial: connected ({p})",
+        "obs_title": "OBS WebSocket:",
+        "obs_connect": "Connect OBS",
+        "obs_nc": "OBS: not connected",
+        "obs_ok": "OBS: connected",
+        "slots": "Slots",
+        "search": "Search slot...",
+        "profile": "Profile:",
+        "sw_auto": "Auto-connect (watcher)",
+        "sw_test": "Test mode (presses only)",
+        "sw_bt": "Bluetooth mode (OBS via spare keys)",
+        "imp": "Import",
+        "exp": "Export",
+        "stats": "Stats",
+        "push": "Write to ESP32",
+        "pushing": "Writing...",
+        "read": "Read",
+        "reset": "Reset",
+        "log": "Log:",
+        "copy": "Copy",
+        "paste": "Paste",
+        "name_lbl": "Custom name:",
+        "ble_on": "BLE: connected",
+        "ble_wait": "BLE: waiting",
+        "keys_note": "Keys are sent by the ESP32 itself — works without the launcher.",
+        "media_note": "Media key is sent by the ESP32 — works without the launcher.",
+        "obs_test": "Test action",
+        "bt_hint": "Will be written as a spare key — bind it in OBS hotkeys",
+        "macro_hint": "Steps separated by | — keys like in Keys (CTRL+C), pause: 300ms or WAIT 300",
+        "macro_run": "Run macro",
+        "cmd_lbl": "Windows command (like Run dialog):",
+        "cmd_run": "Run",
+        "text_lbl": "Text to paste (Ctrl+V):",
+        "text_note": "Text goes to the clipboard and pastes with Ctrl+V — Cyrillic is safe.",
+        "app_lbl": "App:",
+        "app_path": "Path to exe (custom allowed):",
+        "app_args": "Launch arguments:",
+        "app_test": "Test",
+        "http_lbl": "Webhook / API request:",
+        "http_body": "Request body (for POST, JSON):",
+        "http_send": "Send request",
+        "vol_pycaw": "System volume via pycaw.",
+        "vol_no": "pycaw not installed — media keys instead. pip install pycaw comtypes",
+        "none_note": "Pick an action type above — the config is written to the ESP32 with the 'Write to ESP32' button.",
+        "unassigned": "not assigned",
+        "p_macro": "Macro: ",
+        "p_cmd": "Command: ",
+        "p_text": "Text: ",
+        "p_app": "App: ",
+        "p_obs": "OBS: ",
+        "p_vol": "Volume: ",
+        "p_http": "HTTP: ",
+        "empty": " (empty)",
+        "warn_port": "Select a COM port.",
+        "err_find": "No suitable COM port found.\nCheck: is the board plugged in? Is the CH340 driver alive? Is Serial Monitor closed?",
+        "warn_conn_first": "Connect to the ESP32 first.",
+        "log_connected": "Connected: {p}",
+        "log_lost": "Connection lost, retrying — {e}",
+        "log_watch": "Watcher: connecting {p}",
+        "serial_dead": "{p}: port unavailable (6 attempts)",
+        "push_ok": "Configuration written to ESP32 (APPLY confirmed)",
+        "apply_err": "APPLY not confirmed by the board.",
+        "slot_ack": "Slot {s}: no acknowledgment",
+        "slot_err": "Slot {s}: {e}",
+        "port_closed": "Port closed: {e}",
+        "list_hdr": "--- Slots on device ---",
+        "list_fail": "ESP32 did not respond to LIST",
+        "reset_q": "Erase ESP32 settings?",
+        "reset_ok": "ESP32 settings erased",
+        "obs_lib": "obsws-python not installed.\npip install obsws-python",
+        "obs_fail": "Could not connect:\n{e}\n\nEnable the WebSocket server in OBS: Tools → WebSocket Server Settings.",
+        "obs_log": "OBS connected: {s} scenes, {i} sources",
+        "warn_obs_first": "Connect to OBS first.",
+        "stats_empty": "Stats are empty — press something on the deck",
+        "stats_hdr": "--- Top presses ---",
+        "prof_saved": "Profile saved: {n}",
+        "prof_loaded": "Profile loaded: {n}",
+        "prof_load_msg": "Profile '{n}' loaded.\nPress 'Write to ESP32' to apply it to the board.",
+        "prof_del_q": "Delete profile '{n}'?",
+        "prof_deleted": "Profile deleted: {n}",
+        "prof_none": "No profile selected.",
+        "prof_name_q": "Profile name:",
+        "prof_new_t": "New profile",
+        "exp_ok": "Config exported: {p}",
+        "exp_fail": "Could not save:\n{e}",
+        "imp_fail": "Could not read:\n{e}",
+        "imp_ok": "Config loaded.\nPress 'Write to ESP32' to apply it to the board.",
+        "imp_log": "Config imported: {p}",
+        "cfg_fail": "Could not save config: {e}",
+        "copied": "Slot copied: {s}",
+        "pasted": "Slot pasted: {s}",
+        "macro_empty_q": "Macro is empty.",
+        "macro_bad": "Macro: unknown steps — {e}",
+        "no_pynput": "pynput not installed — pip install pynput",
+        "macro_err": "Macro: error — {e}",
+        "clip_err": "Clipboard: {e}",
+        "paste_err": "Paste: {e}",
+        "cmd_ok": "Command started: {c}",
+        "cmd_err": "Command: error — {e}",
+        "closed_n": "Processes closed: {n}",
+        "not_found": "Process not found",
+        "focus_ok": "Window focused",
+        "focus_retry": "Window not found — launching again",
+        "path_missing": "App path not set",
+        "run_ok": "Launched: {p}",
+        "run_err": "Launch: error — {e}",
+        "gw_missing": "pygetwindow not installed — pip install pygetwindow",
+        "focus_err": "Focus: error — {e}",
+        "http_ok": "HTTP {m}: response {c}",
+        "http_code": "HTTP: server replied {c}",
+        "http_err": "HTTP: error — {e}",
+        "vol_log": "Volume: {r}",
+        "test_log": "TEST: {s}",
+        "app_path_q": "Set the exe path.",
+        "url_q": "Set the URL.",
+        "push_msg_hdr": "Configuration written to ESP32.\n\nIn OBS: Settings → Hotkeys, assign:\n",
+        "push_msg_tip": "\n\nTip: click the OBS hotkey field and press a deck button — the combo fills itself.",
+        "push_done": "Configuration written to ESP32.",
+        "done": "Done",
+        "obs_err_log": "OBS: error — {e}",
+        "err_serial": "Serial",
+        "err_find_t": "Search",
+        "err_esp32": "ESP32",
+        "obs_t": "OBS",
+        "macro_t": "Macro",
+        "cmd_t": "Command",
+        "text_t": "Text",
+        "app_t": "App",
+        "http_t": "HTTP",
+        "profile_t": "Profile",
+        "exp_t": "Export",
+        "imp_t": "Import",
+        "reset_t": "Reset",
+    },
+}
+
+# --- справочники: хранятся кодами, отображаются по языку ---
+TYPE_LABELS_L = {
+    "ru": {"none": "Не назначено", "keys": "Клавиши", "media": "Медиа",
+           "obs": "OBS", "macro": "Макрос", "cmd": "Команда",
+           "text": "Текст", "app": "Приложение", "http": "HTTP",
+           "vol": "Громкость"},
+    "en": {"none": "None", "keys": "Keys", "media": "Media", "obs": "OBS",
+           "macro": "Macro", "cmd": "Command", "text": "Text",
+           "app": "App", "http": "HTTP", "vol": "Volume"},
+}
+TYPE_CODES = list(TYPE_LABELS_L["ru"].keys())
+
+OBS_LABELS_L = {
+    "ru": {"scene": "Смена сцены", "stream": "Старт/стоп стрима",
+           "record": "Старт/стоп записи", "mute_src": "Мут источника",
+           "transition": "Переход (студийный режим)",
+           "replay": "Реплей-буфер"},
+    "en": {"scene": "Switch scene", "stream": "Start/Stop stream",
+           "record": "Start/Stop recording", "mute_src": "Mute source",
+           "transition": "Studio mode transition",
+           "replay": "Replay buffer"},
+}
+OBS_CODES = list(OBS_LABELS_L["ru"].keys())
+
+APP_LABELS_L = {
+    "ru": {"launch": "Запустить", "toggle": "Переключить (фокус/запуск)",
+           "focus": "Фокус", "close": "Закрыть"},
+    "en": {"launch": "Launch", "toggle": "Toggle (focus/launch)",
+           "focus": "Focus", "close": "Close"},
+}
+APP_MODE_CODES = list(APP_LABELS_L["ru"].keys())
+
+VOL_LABELS_L = {
+    "ru": {"up": "Громче", "down": "Тише", "mute": "Мут"},
+    "en": {"up": "Volume up", "down": "Volume down", "mute": "Mute"},
+}
+VOL_CODES = list(VOL_LABELS_L["ru"].keys())
+
+CUSTOM_APP_L = {"ru": "Другое (свой путь)", "en": "Custom (own path)"}
+CUSTOM_APP_CODE = "custom"
+
+# --- совместимость со старыми русскими конфигами ---
+LEG_OBS = {"Смена сцены": "scene", "Старт/стоп стрима": "stream",
+           "Старт/стоп записи": "record", "Мут источника": "mute_src",
+           "Переход (студийный режим)": "transition",
+           "Реплей-буфер": "replay"}
+LEG_APP = {"Запустить": "launch", "Переключить (фокус/запуск)": "toggle",
+           "Фокус": "focus", "Закрыть": "close"}
+LEG_VOL = {"Громче": "up", "Тише": "down", "Мут": "mute"}
+LEG_PRESET = {"Другое (свой путь)": "custom"}
+
+BTN_NAMES_L = {
+    "ru": ["Кнопка 1", "Кнопка 2", "Кнопка 3", "Кнопка 4"],
+    "en": ["Button 1", "Button 2", "Button 3", "Button 4"],
+}
+KIND_NAMES_L = {
+    "ru": ["Короткое", "Долгое", "Двойное"],
+    "en": ["Short press", "Long press", "Double press"],
+}
+COMBO_NAMES_L = {
+    "ru": ["1 + 2", "1 + 3", "1 + 4", "2 + 3", "2 + 4", "3 + 4",
+           "1 + 2 + 3", "1 + 2 + 4", "1 + 3 + 4", "2 + 3 + 4", "Все четыре"],
+    "en": ["1 + 2", "1 + 3", "1 + 4", "2 + 3", "2 + 4", "3 + 4",
+           "1 + 2 + 3", "1 + 2 + 4", "1 + 3 + 4", "2 + 3 + 4", "All four"],
+}
+
+KINDS = [("s", 0), ("l", 1), ("d", 2)]
+BUTTONS = [("b1", 0), ("b2", 1), ("b3", 2), ("b4", 3)]
+COMBOS = ["c12", "c13", "c14", "c23", "c24", "c34",
+          "c123", "c124", "c134", "c234", "c1234"]
+
+ALL_SLOTS = [f"{b}{k}" for b, _ in BUTTONS for k, _ in KINDS] + COMBOS
+
+
+def slot_title(sid, lang):
+    btn_names = BTN_NAMES_L.get(lang, BTN_NAMES_L["ru"])
+    kind_names = KIND_NAMES_L.get(lang, KIND_NAMES_L["ru"])
+    combo_names = COMBO_NAMES_L.get(lang, COMBO_NAMES_L["ru"])
+    for bid, bidx in BUTTONS:
+        for kind, kidx in KINDS:
+            if sid == f"{bid}{kind}":
+                return f"{btn_names[bidx]} — {kind_names[kidx]}"
+    if sid in COMBOS:
+        return f"{combo_names[COMBOS.index(sid)]}"
+    return sid
+
+DEFAULT_SLOTS = {
+    "b1s": {"type": "media", "media": "PLAY"},
+    "b2s": {"type": "media", "media": "VOLUP"},
+    "b3s": {"type": "media", "media": "VOLDOWN"},
+    "b4s": {"type": "media", "media": "MUTE"},
+}
+
+LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+PROGRAMFILES = os.environ.get("ProgramFiles", "C:\\Program Files")
+PROGRAMFILESX86 = os.environ.get("ProgramFiles(x86)",
+                                 "C:\\Program Files (x86)")
+
+APP_PRESETS = {
+    "Spotify": {"proc": ["spotify.exe"], "win": "Spotify",
+                "path": os.path.join(LOCALAPPDATA, "Spotify", "Spotify.exe"),
+                "args": ""},
+    "Discord": {"proc": ["discord.exe"], "win": "Discord",
+                "path": os.path.join(LOCALAPPDATA, "Discord", "Update.exe"),
+                "args": "--processStart Discord.exe"},
+    "Telegram": {"proc": ["telegram.exe"], "win": "Telegram",
+                 "path": os.path.join(LOCALAPPDATA, "Telegram Desktop",
+                                      "Telegram.exe"),
+                 "args": ""},
+    "WhatsApp": {"proc": ["whatsapp.exe"], "win": "WhatsApp",
+                 "path": os.path.join(LOCALAPPDATA, "WhatsApp",
+                                      "WhatsApp.exe"),
+                 "args": ""},
+    "Google Chrome": {"proc": ["chrome.exe"], "win": "Chrome",
+                      "path": os.path.join(PROGRAMFILES, "Google", "Chrome",
+                                           "Application", "chrome.exe"),
+                      "args": ""},
+    "Mozilla Firefox": {"proc": ["firefox.exe"], "win": "Firefox",
+                        "path": os.path.join(PROGRAMFILES, "Mozilla Firefox",
+                                             "firefox.exe"),
+                        "args": ""},
+    "VS Code": {"proc": ["code.exe"], "win": "Visual Studio Code",
+                "path": os.path.join(LOCALAPPDATA, "Programs",
+                                     "Microsoft VS Code", "Code.exe"),
+                "args": ""},
+    "OBS Studio": {"proc": ["obs64.exe"], "win": "OBS",
+                   "path": os.path.join(PROGRAMFILES, "obs-studio", "bin",
+                                        "64bit", "obs64.exe"),
+                   "args": ""},
+    "Steam": {"proc": ["steam.exe"], "win": "Steam",
+              "path": "C:\\Program Files (x86)\\Steam\\steam.exe",
+              "args": ""},
+    "Epic Games": {"proc": ["epicgameslauncher.exe"], "win": "Epic Games",
+                   "path": os.path.join(PROGRAMFILESX86, "Epic Games",
+                                        "Launcher", "Portal", "Binaries",
+                                        "Win64", "EpicGamesLauncher.exe"),
+                   "args": ""},
+    "Zoom": {"proc": ["zoom.exe"], "win": "Zoom",
+             "path": os.path.join(LOCALAPPDATA, "Zoom", "bin", "Zoom.exe"),
+             "args": ""},
+    "VLC": {"proc": ["vlc.exe"], "win": "VLC",
+            "path": os.path.join(PROGRAMFILESX86, "VideoLAN", "VLC",
+                                 "vlc.exe"),
+            "args": ""},
+    "Notepad": {"proc": ["notepad.exe"], "win": "Блокнот",
+                "path": "notepad.exe", "args": ""},
+    "Калькулятор": {"proc": ["calculatorapp.exe"], "win": "Калькулятор",
+                    "path": "calculator:", "args": ""},
+    "Проводник": {"proc": ["explorer.exe"], "win": "Проводник",
+                  "path": "explorer.exe", "args": ""},
+    "Диспетчер задач": {"proc": ["taskmgr.exe"], "win": "Диспетчер задач",
+                        "path": "taskmgr.exe", "args": ""},
+    "Paint": {"proc": ["mspaint.exe"], "win": "Paint",
+              "path": "mspaint.exe", "args": ""},
+    "Snipping Tool": {"proc": ["snippingtool.exe"], "win": "Фрагмент",
+                      "path": "ms-screenclip:", "args": ""},
+}
+
+BLOCK_SIZE = 6
+FLASH_COLOR = "#ffb74d"
+FLASH_BG = "#8a5a1f"
+BORDER_IDLE = "#3a3f4b"
+BORDER_SEL = "#4d8fe0"
+OK_COLOR = "#66bb6a"
+ERR_COLOR = "#ef5350"
+IDLE_COLOR = "#9aa0a6"
+HOVER_COLOR = "#2a2f38"
+SEL_BG = "#33415c"
+SERIAL_VENDORS = ["ch340", "ch341", "cp210", "usb-serial", "usb serial",
+                  "uart", "jtag", "esp32", "silicon labs"]
+
+MODS = ["CTRL", "SHIFT", "ALT", "GUI"]
+KEY_NAMES = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+    "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "SPACE",
+    "ENTER", "ESC", "BKSP", "TAB",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "LEFT", "RIGHT", "UP", "DOWN", "HOME", "END", "PGUP", "PGDN", "DEL",
+]
+MEDIA_NAMES = ["PLAY", "STOP", "NEXT", "PREV", "MUTE", "VOLUP", "VOLDOWN"]
+HTTP_METHODS = ["GET", "POST"]
+
+TYPE_COLORS = {"none": "#9aa0a6", "keys": "#5aa2f7", "media": "#66bb6a",
+               "obs": "#ffa726", "macro": "#ba68c8", "cmd": "#4db6ac",
+               "text": "#f06292", "app": "#64b5f6", "http": "#9575cd",
+               "vol": "#4fc3f7"}
+
+PYNPUT_MAP = {}
+if HAS_PYNPUT:
+    PYNPUT_MAP = {
+        "CTRL": _PKey.ctrl, "SHIFT": _PKey.shift, "ALT": _PKey.alt,
+        "GUI": _PKey.cmd, "SPACE": " ",
+        "ENTER": _PKey.enter, "ESC": _PKey.esc, "BKSP": _PKey.backspace,
+        "TAB": _PKey.tab,
+        "LEFT": _PKey.left, "RIGHT": _PKey.right, "UP": _PKey.up,
+        "DOWN": _PKey.down,
+        "HOME": _PKey.home, "END": _PKey.end,
+        "PGUP": _PKey.page_up, "PGDN": _PKey.page_down,
+        "DEL": _PKey.delete,
+        "F1": _PKey.f1, "F2": _PKey.f2, "F3": _PKey.f3, "F4": _PKey.f4,
+        "F5": _PKey.f5, "F6": _PKey.f6, "F7": _PKey.f7, "F8": _PKey.f8,
+        "F9": _PKey.f9, "F10": _PKey.f10, "F11": _PKey.f11, "F12": _PKey.f12,
+    }
+
+
+def parse_macro(text):
+    steps, errors = [], []
+    for raw in (t.strip() for t in text.replace("\n", " | ").split("|")):
+        if not raw:
+            continue
+        low = raw.lower()
+        if low.startswith("wait"):
+            arg = raw[4:].strip()
+            for suf in ("ms", "мс"):
+                if arg.lower().endswith(suf):
+                    arg = arg[:-len(suf)].strip()
+                    break
+            try:
+                steps.append(("wait", max(10, int(arg))))
+            except ValueError:
+                errors.append(raw)
+            continue
+        if low.endswith("ms") and low[:-2].strip().isdigit():
+            steps.append(("wait", max(10, int(low[:-2].strip()))))
+            continue
+        names = [p.strip().upper() for p in raw.split("+") if p.strip()]
+        if names:
+            steps.append(("combo", names))
+        else:
+            errors.append(raw)
+    return steps, errors
+
+
+def find_proc(procs):
+    if not HAS_PSUTIL:
+        return None
+    procs = [p.lower() for p in procs if p]
+    try:
+        for p in psutil.process_iter(["name"]):
+            n = (p.info.get("name") or "").lower()
+            if any(n == q or n.startswith(q) for q in procs):
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def kill_procs(procs):
+    if not HAS_PSUTIL:
+        return 0
+    procs = [p.lower() for p in procs if p]
+    killed = 0
+    try:
+        for p in psutil.process_iter(["name"]):
+            n = (p.info.get("name") or "").lower()
+            if any(n == q or n.startswith(q) for q in procs):
+                p.terminate()
+                killed += 1
+    except Exception:
+        pass
+    return killed
+
+
+def sys_volume_step(code):
+    """Системная громкость. pycaw — плавно; иначе медиа-клавиши."""
+    if HAS_PYCAW:
+        try:
+            dev = AudioUtilities.GetSpeakers()
+            iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            vol = cast(iface, POINTER(IAudioEndpointVolume))
+            if code == "mute":
+                vol.SetMute(not bool(vol.GetMute()), None)
+                return "mute"
+            cur = vol.GetMasterVolumeLevelScalar()
+            step = 0.05 if code == "up" else -0.05
+            new = max(0.0, min(1.0, cur + step))
+            vol.SetMasterVolumeLevelScalar(new, None)
+            return f"{int(round(new * 100))}%"
+        except Exception:
+            pass
+    if HAS_PYNPUT:
+        kb = _KbController()
+        key = {"up": _PKey.media_volume_up,
+               "down": _PKey.media_volume_down,
+               "mute": _PKey.media_volume_mute}.get(code)
+        if key is not None:
+            kb.press(key)
+            kb.release(key)
+            return code
+    return "no pycaw / no pynput"
+
+
+class StreamDeckApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.ser = None
+        self.running = False
+        self.conn_thread = None
+        self.io_lock = threading.Lock()
+        self.rx_queue = queue.Queue()
+        self.reply_q = queue.Queue()
+        self.obs_client = None
+        self.obs_scenes, self.obs_inputs = [], []
+        self.obs_lock = threading.Lock()
+        self.flash_timers = {}
+        self._ports = {}
+        self.busy = False
+        self.selected = None
+        self.list_buttons = {}
+        self.ed = {}
+        self.clip_slot = None
+        self._watcher_stop = threading.Event()
+        self._manual_disconnect = False
+
+        self.cfg = self.load_config()
+        self.lang = self.cfg.get("lang", "ru")
+        if self.lang not in STR:
+            self.lang = "ru"
+
+        self.title(self.T("title"))
+        self.geometry("1280x880")
+        self.minsize(1080, 700)
+        self.build_ui()
+        self.render_slot_list()
+        self.select_slot(ALL_SLOTS[0])
+        self.after(50, self.poll_rx)
+        threading.Thread(target=self._watcher_loop, daemon=True).start()
+
+    # ---------------- переводы ----------------
+    def T(self, key, **kw):
+        s = STR.get(self.lang, STR["ru"]).get(key)
+        if s is None:
+            s = STR["ru"].get(key, key)
+        return s.format(**kw) if kw else s
+
+    def type_label(self, code):
+        return TYPE_LABELS_L[self.lang].get(code, code)
+
+    def type_code(self, label):
+        for c in TYPE_CODES:
+            if TYPE_LABELS_L[self.lang].get(c) == label:
+                return c
+        return "none"
+
+    def obs_label(self, code):
+        return OBS_LABELS_L[self.lang].get(code, code)
+
+    def obs_code(self, label):
+        for c in OBS_CODES:
+            if OBS_LABELS_L[self.lang].get(c) == label:
+                return c
+        return LEG_OBS.get(label, label)
+
+    def app_label(self, code):
+        return APP_LABELS_L[self.lang].get(code, code)
+
+    def app_code(self, label):
+        for c in APP_MODE_CODES:
+            if APP_LABELS_L[self.lang].get(c) == label:
+                return c
+        return LEG_APP.get(label, "toggle")
+
+    def vol_label(self, code):
+        return VOL_LABELS_L[self.lang].get(code, code)
+
+    def vol_code(self, label):
+        for c in VOL_CODES:
+            if VOL_LABELS_L[self.lang].get(c) == label:
+                return c
+        return LEG_VOL.get(label, "up")
+
+    def custom_label(self):
+        return CUSTOM_APP_L[self.lang]
+
+    # ---------------- конфиг ----------------
+    def load_config(self):
+        cfg = {"obs": {"host": "localhost", "port": 4455, "password": ""},
+               "slots": {}, "bt_mode": True, "profiles": {}, "last_port": "",
+               "auto_connect": True, "stats": {}, "lang": "ru"}
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg["obs"].update(saved.get("obs", {}))
+            cfg["slots"].update(saved.get("slots", {}))
+            cfg["bt_mode"] = saved.get("bt_mode", True)
+            cfg["profiles"] = saved.get("profiles", {})
+            cfg["last_port"] = saved.get("last_port", "")
+            cfg["auto_connect"] = saved.get("auto_connect", True)
+            cfg["stats"] = saved.get("stats", {})
+            cfg["lang"] = saved.get("lang", "ru")
+        except Exception:
+            pass
+        for sid in ALL_SLOTS:
+            box = cfg["slots"].setdefault(
+                sid, deepcopy(DEFAULT_SLOTS.get(sid, {"type": "none"})))
+            # нормализация старых русских значений во внутренние коды
+            if box.get("obs_action") in LEG_OBS:
+                box["obs_action"] = LEG_OBS[box["obs_action"]]
+            if box.get("type") == "app" and box.get("mode") in LEG_APP:
+                box["mode"] = LEG_APP[box["mode"]]
+            if box.get("type") == "vol" and box.get("mode") in LEG_VOL:
+                box["mode"] = LEG_VOL[box["mode"]]
+            if box.get("preset") in LEG_PRESET:
+                box["preset"] = LEG_PRESET[box["preset"]]
+            # профили тоже
+        for prof in cfg.get("profiles", {}).values():
+            for box in prof.get("slots", {}).values():
+                if box.get("obs_action") in LEG_OBS:
+                    box["obs_action"] = LEG_OBS[box["obs_action"]]
+                if box.get("type") == "app" and box.get("mode") in LEG_APP:
+                    box["mode"] = LEG_APP[box["mode"]]
+                if box.get("type") == "vol" and box.get("mode") in LEG_VOL:
+                    box["mode"] = LEG_VOL[box["mode"]]
+                if box.get("preset") in LEG_PRESET:
+                    box["preset"] = LEG_PRESET[box["preset"]]
+        return cfg
+
+    def save_config(self):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(self.T("cfg_fail", e=e))
+
+    # ---------------- интерфейс ----------------
+    def build_ui(self):
+        self.title(self.T("title"))
+        self.f_title = ctk.CTkFont(size=15, weight="bold")
+        self.f_small = ctk.CTkFont(size=12)
+
+        top = ctk.CTkFrame(self, corner_radius=0)
+        top.pack(fill="x")
+
+        r1 = ctk.CTkFrame(top, fg_color="transparent")
+        r1.pack(fill="x", padx=12, pady=(10, 2))
+        ctk.CTkLabel(r1, text=self.T("port"), font=self.f_small)\
+            .grid(row=0, column=0, sticky="w")
+        self.port_cb = ctk.CTkComboBox(r1, width=250, state="readonly",
+                                       font=self.f_small)
+        self.port_cb.grid(row=0, column=1, padx=(6, 4))
+        ctk.CTkButton(r1, text=self.T("refresh"), width=80,
+                      command=self.refresh_ports,
+                      font=self.f_small).grid(row=0, column=2, padx=2)
+        ctk.CTkButton(r1, text=self.T("connect"), width=100,
+                      command=self.manual_connect,
+                      font=self.f_small).grid(row=0, column=3, padx=2)
+        ctk.CTkButton(r1, text=self.T("find"), width=110,
+                      command=self.auto_connect_now,
+                      font=self.f_small).grid(row=0, column=4, padx=2)
+        ctk.CTkButton(r1, text=self.T("disconnect"), width=88,
+                      command=self.serial_disconnect, fg_color="#5c6470",
+                      hover_color="#3d434c",
+                      font=self.f_small).grid(row=0, column=5, padx=2)
+        self.ser_status = ctk.CTkLabel(r1, text=self.T("ser_nc"),
+                                       text_color=ERR_COLOR,
+                                       font=self.f_small)
+        self.ser_status.grid(row=0, column=6, padx=(12, 0))
+        ctk.CTkLabel(r1, text=self.T("lang"), font=self.f_small)\
+            .grid(row=0, column=7, padx=(24, 4))
+        self.lang_var = tk.StringVar(value=self.lang.upper())
+        ctk.CTkOptionMenu(r1, values=["RU", "EN"], variable=self.lang_var,
+                          command=self.change_lang, width=70,
+                          font=self.f_small).grid(row=0, column=8)
+
+        r2 = ctk.CTkFrame(top, fg_color="transparent")
+        r2.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkLabel(r2, text=self.T("obs_title"), font=self.f_small)\
+            .grid(row=0, column=0, sticky="w")
+        self.obs_host = tk.StringVar(value=self.cfg["obs"]["host"])
+        self.obs_port = tk.StringVar(value=str(self.cfg["obs"]["port"]))
+        self.obs_pass = tk.StringVar(value=self.cfg["obs"]["password"])
+        ctk.CTkEntry(r2, textvariable=self.obs_host, width=150,
+                     font=self.f_small).grid(row=0, column=1, padx=(6, 4))
+        ctk.CTkEntry(r2, textvariable=self.obs_port, width=70,
+                     font=self.f_small).grid(row=0, column=2, padx=4)
+        ctk.CTkEntry(r2, textvariable=self.obs_pass, width=130, show="*",
+                     font=self.f_small).grid(row=0, column=3, padx=4)
+        ctk.CTkButton(r2, text=self.T("obs_connect"), width=130,
+                      command=self.obs_connect,
+                      font=self.f_small).grid(row=0, column=4, padx=4)
+        self.obs_status = ctk.CTkLabel(r2, text=self.T("obs_nc"),
+                                       text_color=ERR_COLOR,
+                                       font=self.f_small)
+        self.obs_status.grid(row=0, column=5, padx=(12, 0), columnspan=2)
+
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=12)
+        main.grid_columnconfigure(0, weight=0)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(main, corner_radius=10)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+
+        ctk.CTkLabel(left, text=self.T("slots"), font=self.f_title)\
+            .pack(anchor="w", padx=10, pady=(10, 4))
+        self.search_entry = ctk.CTkEntry(left,
+                                         placeholder_text=self.T("search"),
+                                         font=self.f_small, height=30)
+        self.search_entry.pack(fill="x", padx=10, pady=(0, 6))
+        self.search_entry.bind("<KeyRelease>",
+                               lambda _: self.render_slot_list())
+
+        self.slot_list = ctk.CTkScrollableFrame(left, width=380,
+                                                fg_color="transparent")
+        self.slot_list.pack(fill="both", expand=True, padx=6, pady=2)
+
+        prow = ctk.CTkFrame(left, fg_color="transparent")
+        prow.pack(fill="x", padx=10, pady=(4, 2))
+        ctk.CTkLabel(prow, text=self.T("profile"),
+                     font=self.f_small).pack(side="left")
+        self.profile_cb = ctk.CTkComboBox(prow, width=140, state="readonly",
+                                          font=self.f_small, values=[])
+        self.profile_cb.pack(side="left", padx=4)
+        ctk.CTkButton(prow, text="＋", width=32, height=26,
+                      command=self.profile_save,
+                      font=self.f_small).pack(side="left", padx=1)
+        ctk.CTkButton(prow, text="▶", width=32, height=26,
+                      command=self.profile_load,
+                      font=self.f_small).pack(side="left", padx=1)
+        ctk.CTkButton(prow, text="✕", width=32, height=26,
+                      command=self.profile_delete, fg_color="#5c6470",
+                      hover_color="#3d434c",
+                      font=self.f_small).pack(side="left", padx=1)
+
+        self.auto_conn_var = tk.BooleanVar(
+            value=self.cfg.get("auto_connect", True))
+        ctk.CTkSwitch(left, text=self.T("sw_auto"),
+                      variable=self.auto_conn_var,
+                      command=self.commit_auto_conn,
+                      font=self.f_small).pack(anchor="w", padx=10,
+                                              pady=(8, 0))
+
+        self.test_mode = tk.BooleanVar(value=False)
+        ctk.CTkSwitch(left, text=self.T("sw_test"),
+                      variable=self.test_mode,
+                      font=self.f_small).pack(anchor="w", padx=10,
+                                              pady=(4, 0))
+
+        self.bt_mode = tk.BooleanVar(value=self.cfg.get("bt_mode", True))
+        ctk.CTkSwitch(left, text=self.T("sw_bt"),
+                      variable=self.bt_mode, command=self.commit_bt_mode,
+                      font=self.f_small).pack(anchor="w", padx=10,
+                                              pady=(4, 2))
+
+        irow = ctk.CTkFrame(left, fg_color="transparent")
+        irow.pack(fill="x", padx=10, pady=(6, 2))
+        ctk.CTkButton(irow, text=self.T("imp"), height=28,
+                      command=self.config_import,
+                      font=self.f_small).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(irow, text=self.T("exp"), height=28,
+                      command=self.config_export,
+                      font=self.f_small).pack(side="left", padx=4)
+        ctk.CTkButton(irow, text=self.T("stats"), height=28,
+                      command=self.show_stats,
+                      font=self.f_small).pack(side="left", padx=4)
+
+        arow = ctk.CTkFrame(left, fg_color="transparent")
+        arow.pack(fill="x", padx=10, pady=(6, 10))
+        self.push_btn = ctk.CTkButton(arow, text=self.T("push"),
+                                      command=self.push_config, height=32,
+                                      font=self.f_small)
+        self.push_btn.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(arow, text=self.T("read"), width=92, height=32,
+                      command=self.read_from_device,
+                      font=self.f_small).pack(side="left", padx=2)
+        ctk.CTkButton(arow, text=self.T("reset"), width=88, height=32,
+                      command=self.reset_device, fg_color="#5c6470",
+                      hover_color="#3d434c",
+                      font=self.f_small).pack(side="left", padx=2)
+
+        right = ctk.CTkFrame(main, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        self.ed_card = ctk.CTkFrame(right, corner_radius=10, border_width=2,
+                                    border_color=BORDER_IDLE)
+        self.ed_card.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+
+        ctk.CTkLabel(right, text=self.T("log"), font=self.f_small)\
+            .grid(row=1, column=0, sticky="w", pady=(0, 2))
+        self.log_box = ctk.CTkTextbox(right, height=130, wrap="none",
+                                      font=("Consolas", 12))
+        self.log_box.grid(row=2, column=0, sticky="ew")
+        self.log_box.configure(state="disabled")
+
+        bar = ctk.CTkFrame(self, corner_radius=0)
+        bar.pack(fill="x", side="bottom")
+        self.ble_status = ctk.CTkLabel(bar, text="BLE: —",
+                                       text_color=IDLE_COLOR,
+                                       font=self.f_small)
+        self.ble_status.pack(side="right", padx=14, pady=6)
+        self.ser_status2 = ctk.CTkLabel(bar, text="Serial: —",
+                                        text_color=IDLE_COLOR,
+                                        font=self.f_small)
+        self.ser_status2.pack(side="right", padx=14, pady=6)
+
+        self.refresh_ports()
+        self.refresh_profiles()
+
+    def change_lang(self, lang):
+        self.lang = lang.lower()
+        self.cfg["lang"] = self.lang
+        self.save_config()
+        for w in self.winfo_children():
+            w.destroy()
+        self.build_ui()
+        self.render_slot_list()
+        self.select_slot(self.selected or ALL_SLOTS[0])
+        self.log(f"Language: {self.lang.upper()}")
+
+    # ---------------- список слотов ----------------
+    def slot_caption(self, sid):
+        c = self.cfg["slots"][sid]
+        name = c.get("name") or slot_title(sid, self.lang)
+        return f"{name}   ·   {self.slot_summary(c)}"
+
+    def render_slot_list(self):
+        query = ""
+        if hasattr(self, "search_entry"):
+            query = self.search_entry.get().lower().strip()
+        for child in self.slot_list.winfo_children():
+            child.destroy()
+        self.list_buttons = {}
+        for sid in ALL_SLOTS:
+            title = (slot_title(sid, self.lang) + " " +
+                     (self.cfg["slots"][sid].get("name") or "")).lower()
+            caption = self.slot_caption(sid)
+            if query and query not in title and query not in caption.lower():
+                continue
+            c = self.cfg["slots"][sid]
+            sel = (sid == self.selected)
+            btn = ctk.CTkButton(
+                self.slot_list, text=caption, anchor="w", height=32,
+                font=self.f_small,
+                fg_color=SEL_BG if sel else "transparent",
+                hover_color=HOVER_COLOR,
+                text_color="#ffffff" if sel else
+                TYPE_COLORS.get(c.get("type", "none"), IDLE_COLOR),
+                command=lambda s=sid: self.select_slot(s))
+            btn.pack(fill="x", pady=1)
+            self.list_buttons[sid] = btn
+
+    def select_slot(self, sid):
+        if self.selected and self.ed:
+            try:
+                self.commit_editor(save=False)
+            except Exception:
+                pass
+        prev = self.selected
+        if prev in self.list_buttons:
+            self.list_buttons[prev].configure(
+                fg_color="transparent",
+                text_color=TYPE_COLORS.get(
+                    self.cfg["slots"][prev].get("type", "none"), IDLE_COLOR))
+        self.selected = sid
+        if sid in self.list_buttons:
+            self.list_buttons[sid].configure(fg_color=SEL_BG,
+                                             text_color="#ffffff")
+        self.render_editor()
+
+    # ---------------- редактор ----------------
+    def param_values(self, action_code):
+        if action_code == "scene":
+            return self.obs_scenes
+        if action_code == "mute_src":
+            return self.obs_inputs
+        return []
+
+    def render_editor(self):
+        for child in self.ed_card.winfo_children():
+            child.destroy()
+        self.ed = {}
+        if not self.selected:
+            return
+        sid = self.selected
+        box = self.cfg["slots"][sid]
+
+        ctk.CTkLabel(self.ed_card, text=slot_title(sid, self.lang),
+                     font=self.f_title)\
+            .pack(anchor="w", padx=14, pady=(14, 2))
+
+        crow = ctk.CTkFrame(self.ed_card, fg_color="transparent")
+        crow.pack(fill="x", padx=14, pady=(0, 4))
+        ctk.CTkButton(crow, text=self.T("copy"), width=110, height=26,
+                      font=self.f_small,
+                      command=self.slot_copy).pack(side="left")
+        self.paste_btn = ctk.CTkButton(
+            crow, text=self.T("paste"), width=100, height=26,
+            font=self.f_small,
+            state="normal" if self.clip_slot else "disabled",
+            command=self.slot_paste)
+        self.paste_btn.pack(side="left", padx=6)
+        ctk.CTkLabel(crow, text=self.T("name_lbl"), font=self.f_small)\
+            .pack(side="left", padx=(10, 4))
+        self.ed["name_entry"] = ctk.CTkEntry(crow, width=160,
+                                             font=self.f_small)
+        self.ed["name_entry"].insert(0, box.get("name", ""))
+        self.ed["name_entry"].pack(side="left")
+        self.ed["name_entry"].bind("<Return>",
+                                   lambda _: self.commit_editor())
+        self.ed["name_entry"].bind("<FocusOut>",
+                                   lambda _: self.commit_editor())
+
+        self.ed["type_var"] = tk.StringVar(value=box.get("type", "none"))
+        trow = ctk.CTkFrame(self.ed_card, fg_color="transparent")
+        trow.pack(fill="x", padx=14)
+        for i, tcode in enumerate(TYPE_CODES):
+            ctk.CTkRadioButton(trow, text=self.type_label(tcode),
+                               value=tcode,
+                               variable=self.ed["type_var"], width=82,
+                               font=self.f_small,
+                               command=self.on_type_change)\
+                .grid(row=0, column=i, padx=(0, 3), sticky="w")
+
+        self.ed["body"] = ctk.CTkFrame(self.ed_card, fg_color="transparent")
+        self.ed["body"].pack(fill="x", padx=14, pady=(8, 4))
+        self.render_editor_body()
+
+        self.ed["summary"] = ctk.CTkLabel(self.ed_card, text="—",
+                                          anchor="w", font=self.f_small)
+        self.ed["summary"].pack(fill="x", padx=14, pady=(4, 14))
+        self.update_summary_label()
+
+    def _combo(self, parent, values, width, readonly=False, initial=""):
+        cb = ctk.CTkComboBox(parent, values=values, width=width,
+                             font=self.f_small,
+                             state="readonly" if readonly else "normal",
+                             command=lambda _v=None: self.commit_editor())
+        cb.set(initial)
+        cb.bind("<Return>", lambda _: self.commit_editor())
+        cb.bind("<FocusOut>", lambda _: self.commit_editor())
+        return cb
+
+    def render_editor_body(self):
+        body = self.ed["body"]
+        for child in body.winfo_children():
+            child.destroy()
+        box = self.cfg["slots"][self.selected]
+        t = box.get("type", "none")
+
+        if t == "keys":
+            self.ed["mod_vars"] = {}
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(anchor="w")
+            for m in MODS:
+                v = tk.BooleanVar(value=m in box.get("mods", []))
+                ctk.CTkCheckBox(row, text=m, variable=v, width=70,
+                                font=self.f_small,
+                                command=self.commit_editor).pack(side="left")
+                self.ed["mod_vars"][m] = v
+            self.ed["key_cb"] = self._combo(body, KEY_NAMES, 120,
+                                            initial=box.get("key", "F1"))
+            self.ed["key_cb"].pack(anchor="w", pady=4)
+            ctk.CTkLabel(body, text=self.T("keys_note"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+        elif t == "media":
+            self.ed["media_cb"] = self._combo(body, MEDIA_NAMES, 120,
+                                              initial=box.get("media", "PLAY"))
+            self.ed["media_cb"].pack(anchor="w")
+            ctk.CTkLabel(body, text=self.T("media_note"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w", pady=2)
+        elif t == "obs":
+            self.ed["action_cb"] = self._combo(
+                body, [self.obs_label(c) for c in OBS_CODES], 240,
+                readonly=True,
+                initial=self.obs_label(box.get("obs_action", "scene")))
+            self.ed["action_cb"].pack(fill="x")
+            self.ed["action_cb"].configure(
+                command=lambda _v=None: self.on_action_change())
+            self.ed["param_cb"] = self._combo(
+                body, self.param_values(self.obs_code(
+                    self.ed["action_cb"].get())), 240,
+                initial=box.get("obs_param", ""))
+            self.ed["param_cb"].pack(fill="x", pady=4)
+            trow2 = ctk.CTkFrame(body, fg_color="transparent")
+            trow2.pack(anchor="w", pady=4)
+            ctk.CTkButton(trow2, text=self.T("obs_test"), width=150,
+                          height=28, font=self.f_small,
+                          command=self.test_obs_action).pack(side="left")
+            if self.bt_mode.get():
+                ctk.CTkLabel(trow2, text=self.T("bt_hint"),
+                             text_color=IDLE_COLOR,
+                             font=self.f_small).pack(side="left", padx=8)
+        elif t == "macro":
+            ctk.CTkLabel(body, text=self.T("macro_hint"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["macro_box"] = ctk.CTkTextbox(body, height=90,
+                                                  font=self.f_small)
+            self.ed["macro_box"].insert("1.0",
+                                        box.get("steps",
+                                                "CTRL+C | 200ms | CTRL+V"))
+            self.ed["macro_box"].pack(fill="x", pady=4)
+            self.ed["macro_box"].bind("<FocusOut>",
+                                      lambda _: self.commit_editor())
+            brow = ctk.CTkFrame(body, fg_color="transparent")
+            brow.pack(anchor="w", pady=2)
+            ctk.CTkButton(brow, text=self.T("macro_run"), width=150,
+                          height=28, font=self.f_small,
+                          command=self.test_macro).pack(side="left")
+        elif t == "cmd":
+            ctk.CTkLabel(body, text=self.T("cmd_lbl"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["cmd_entry"] = ctk.CTkEntry(body, width=420,
+                                                font=self.f_small)
+            self.ed["cmd_entry"].insert(0, box.get("cmd", ""))
+            self.ed["cmd_entry"].pack(fill="x", pady=4)
+            self.ed["cmd_entry"].bind("<Return>",
+                                      lambda _: self.commit_editor())
+            self.ed["cmd_entry"].bind("<FocusOut>",
+                                      lambda _: self.commit_editor())
+            ctk.CTkButton(body, text=self.T("cmd_run"), width=110, height=28,
+                          font=self.f_small,
+                          command=self.test_cmd).pack(anchor="w", pady=2)
+        elif t == "text":
+            ctk.CTkLabel(body, text=self.T("text_lbl"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["txt_entry"] = ctk.CTkEntry(body, width=420,
+                                                font=self.f_small)
+            self.ed["txt_entry"].insert(0, box.get("txt", ""))
+            self.ed["txt_entry"].pack(fill="x", pady=4)
+            self.ed["txt_entry"].bind("<Return>",
+                                      lambda _: self.commit_editor())
+            self.ed["txt_entry"].bind("<FocusOut>",
+                                      lambda _: self.commit_editor())
+            ctk.CTkLabel(body, text=self.T("text_note"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+        elif t == "app":
+            ctk.CTkLabel(body, text=self.T("app_lbl"),
+                         font=self.f_small, anchor="w").pack(anchor="w")
+            self.ed["app_cb"] = self._combo(
+                body, list(APP_PRESETS.keys()) + [self.custom_label()], 260,
+                readonly=True,
+                initial=box.get("preset", "Spotify")
+                if box.get("preset") != CUSTOM_APP_CODE else self.custom_label())
+            self.ed["app_cb"].configure(
+                command=lambda _v=None: self.on_app_preset_change())
+            self.ed["mode_cb"] = self._combo(
+                body, [self.app_label(c) for c in APP_MODE_CODES], 260,
+                readonly=True,
+                initial=self.app_label(box.get("mode", "toggle")))
+            self.ed["mode_cb"].pack(fill="x", pady=4)
+            ctk.CTkLabel(body, text=self.T("app_path"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["path_entry"] = ctk.CTkEntry(body, width=420,
+                                                 font=self.f_small)
+            self.ed["path_entry"].insert(0, box.get("path", ""))
+            self.ed["path_entry"].pack(fill="x", pady=2)
+            self.ed["path_entry"].bind("<FocusOut>",
+                                       lambda _: self.commit_editor())
+            ctk.CTkLabel(body, text=self.T("app_args"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["args_entry"] = ctk.CTkEntry(body, width=420,
+                                                 font=self.f_small)
+            self.ed["args_entry"].insert(0, box.get("args", ""))
+            self.ed["args_entry"].pack(fill="x", pady=2)
+            self.ed["args_entry"].bind("<FocusOut>",
+                                       lambda _: self.commit_editor())
+            brow = ctk.CTkFrame(body, fg_color="transparent")
+            brow.pack(anchor="w", pady=4)
+            ctk.CTkButton(brow, text=self.T("app_test"), width=110,
+                          height=28, font=self.f_small,
+                          command=self.test_app).pack(side="left")
+            self._fill_app_path()
+        elif t == "http":
+            ctk.CTkLabel(body, text=self.T("http_lbl"),
+                         font=self.f_small, anchor="w").pack(anchor="w")
+            self.ed["http_m_cb"] = self._combo(
+                body, HTTP_METHODS, 90, readonly=True,
+                initial=box.get("method", "GET"))
+            self.ed["http_m_cb"].pack(anchor="w", pady=2)
+            self.ed["url_entry"] = ctk.CTkEntry(
+                body, width=460, font=self.f_small,
+                placeholder_text="https://...")
+            self.ed["url_entry"].insert(0, box.get("url", ""))
+            self.ed["url_entry"].pack(fill="x", pady=2)
+            self.ed["url_entry"].bind("<FocusOut>",
+                                      lambda _: self.commit_editor())
+            ctk.CTkLabel(body, text=self.T("http_body"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+            self.ed["body_entry"] = ctk.CTkEntry(body, width=460,
+                                                 font=self.f_small)
+            self.ed["body_entry"].insert(0, box.get("body", ""))
+            self.ed["body_entry"].pack(fill="x", pady=2)
+            self.ed["body_entry"].bind("<FocusOut>",
+                                       lambda _: self.commit_editor())
+            ctk.CTkButton(body, text=self.T("http_send"), width=150,
+                          height=28, font=self.f_small,
+                          command=self.test_http).pack(anchor="w", pady=4)
+        elif t == "vol":
+            self.ed["vol_cb"] = self._combo(
+                body, [self.vol_label(c) for c in VOL_CODES], 120,
+                readonly=True,
+                initial=self.vol_label(box.get("mode", "up")))
+            self.ed["vol_cb"].pack(anchor="w")
+            note = self.T("vol_pycaw") if HAS_PYCAW else self.T("vol_no")
+            ctk.CTkLabel(body, text=note, text_color=IDLE_COLOR,
+                         font=self.f_small, anchor="w").pack(anchor="w",
+                                                             pady=2)
+        else:
+            ctk.CTkLabel(body, text=self.T("none_note"),
+                         text_color=IDLE_COLOR, font=self.f_small,
+                         anchor="w").pack(anchor="w")
+
+    def _fill_app_path(self):
+        if "path_entry" not in self.ed:
+            return
+        preset = APP_PRESETS.get(self.ed["app_cb"].get())
+        if preset and preset.get("path"):
+            self.ed["path_entry"].delete(0, "end")
+            self.ed["path_entry"].insert(0, preset["path"])
+            self.ed["args_entry"].delete(0, "end")
+            self.ed["args_entry"].insert(0, preset.get("args", ""))
+
+    def on_app_preset_change(self):
+        self._fill_app_path()
+        self.commit_editor()
+
+    def on_type_change(self):
+        if not self.selected or not self.ed:
+            return
+        self.cfg["slots"][self.selected]["type"] = self.ed["type_var"].get()
+        self.render_editor_body()
+        self.commit_editor()
+
+    def on_action_change(self):
+        code = self.obs_code(self.ed["action_cb"].get())
+        self.ed["param_cb"].configure(values=self.param_values(code))
+        if code not in ("scene", "mute_src"):
+            self.ed["param_cb"].set("")
+        self.commit_editor()
+
+    def collect_editor(self):
+        t = self.ed["type_var"].get()
+        c = {"type": t,
+             "name": self.ed["name_entry"].get().strip()
+             if "name_entry" in self.ed else ""}
+        if t == "keys":
+            if "mod_vars" in self.ed and "key_cb" in self.ed:
+                c["mods"] = [m for m in MODS if self.ed["mod_vars"][m].get()]
+                c["key"] = self.ed["key_cb"].get()
+        elif t == "media":
+            if "media_cb" in self.ed:
+                c["media"] = self.ed["media_cb"].get()
+        elif t == "obs":
+            if "action_cb" in self.ed and "param_cb" in self.ed:
+                c["obs_action"] = self.obs_code(self.ed["action_cb"].get())
+                c["obs_param"] = self.ed["param_cb"].get()
+        elif t == "macro":
+            if "macro_box" in self.ed:
+                c["steps"] = self.ed["macro_box"].get("1.0", "end").strip()
+        elif t == "cmd":
+            if "cmd_entry" in self.ed:
+                c["cmd"] = self.ed["cmd_entry"].get().strip()
+        elif t == "text":
+            if "txt_entry" in self.ed:
+                c["txt"] = self.ed["txt_entry"].get()
+        elif t == "app":
+            if "app_cb" in self.ed:
+                preset = self.ed["app_cb"].get()
+                c["preset"] = (CUSTOM_APP_CODE
+                               if preset == self.custom_label() else preset)
+                c["mode"] = self.app_code(self.ed["mode_cb"].get())
+                c["path"] = self.ed["path_entry"].get().strip()
+                c["args"] = self.ed["args_entry"].get().strip()
+        elif t == "http":
+            if "url_entry" in self.ed:
+                c["method"] = self.ed["http_m_cb"].get()
+                c["url"] = self.ed["url_entry"].get().strip()
+                c["body"] = self.ed["body_entry"].get().strip()
+        elif t == "vol":
+            if "vol_cb" in self.ed:
+                c["mode"] = self.vol_code(self.ed["vol_cb"].get())
+        return c
+
+    def commit_editor(self, save=True):
+        if not self.selected or not self.ed:
+            return
+        try:
+            self.cfg["slots"][self.selected] = self.collect_editor()
+        except Exception:
+            return
+        self.update_summary_label()
+        self.render_slot_list()
+        if self.selected in self.list_buttons:
+            self.list_buttons[self.selected].configure(fg_color=SEL_BG,
+                                                       text_color="#ffffff")
+        if save:
+            self.save_config()
+
+    def commit_bt_mode(self):
+        self.cfg["bt_mode"] = self.bt_mode.get()
+        self.save_config()
+        if self.selected and self.cfg["slots"][self.selected].get(
+                "type") == "obs":
+            self.render_editor_body()
+
+    def commit_auto_conn(self):
+        self.cfg["auto_connect"] = self.auto_conn_var.get()
+        self.save_config()
+
+    def slot_summary(self, c):
+        t = c.get("type", "none")
+        e = self.T("empty")
+        if t == "keys":
+            return "+".join(c.get("mods", []) + [c.get("key", "")])
+        if t == "media":
+            return c.get("media", "")
+        if t == "obs":
+            s = self.T("p_obs") + self.obs_label(c.get("obs_action", "scene"))
+            if c.get("obs_param"):
+                s += " — " + c["obs_param"]
+            return s
+        if t == "macro":
+            s = c.get("steps", "")
+            return (self.T("p_macro") + s[:46] + "…") if len(s) > 46 else \
+                   (self.T("p_macro") + s if s else self.T("p_macro").strip() + e)
+        if t == "cmd":
+            s = c.get("cmd", "")
+            return (self.T("p_cmd") + s[:40] + "…") if len(s) > 40 else \
+                   (self.T("p_cmd") + s if s else self.T("p_cmd").strip() + e)
+        if t == "text":
+            s = c.get("txt", "")
+            return (self.T("p_text") + s[:40] + "…") if len(s) > 40 else \
+                   (self.T("p_text") + s if s else self.T("p_text").strip() + e)
+        if t == "app":
+            preset = c.get("preset")
+            if preset == CUSTOM_APP_CODE:
+                preset = self.custom_label()
+            return (self.T("p_app") + (preset or c.get("path") or "—")
+                    + " · " + self.app_label(c.get("mode", "toggle")))
+        if t == "http":
+            u = c.get("url", "")
+            return (self.T("p_http") + u[:40] + "…") if len(u) > 40 else \
+                   (self.T("p_http") + u if u else self.T("p_http").strip() + e)
+        if t == "vol":
+            return self.T("p_vol") + self.vol_label(c.get("mode", "up"))
+        return self.T("unassigned")
+
+    def update_summary_label(self):
+        if "summary" in self.ed and self.selected:
+            c = self.cfg["slots"][self.selected]
+            self.ed["summary"].configure(
+                text=self.slot_summary(c),
+                text_color=TYPE_COLORS.get(c.get("type", "none"), IDLE_COLOR))
+
+    # ---------------- копирование слотов ----------------
+    def slot_copy(self):
+        if not self.selected:
+            return
+        self.clip_slot = deepcopy(self.cfg["slots"][self.selected])
+        self.paste_btn.configure(state="normal")
+        self.log(self.T("copied", s=slot_title(self.selected, self.lang)))
+
+    def slot_paste(self):
+        if not self.selected or not self.clip_slot:
+            return
+        self.cfg["slots"][self.selected] = deepcopy(self.clip_slot)
+        self.save_config()
+        self.render_editor()
+        self.render_slot_list()
+        if self.selected in self.list_buttons:
+            self.list_buttons[self.selected].configure(fg_color=SEL_BG,
+                                                       text_color="#ffffff")
+        self.log(self.T("pasted", s=slot_title(self.selected, self.lang)))
+
+    # ---------------- исполнение действий ----------------
+    @staticmethod
+    def py_key(name):
+        if name in PYNPUT_MAP:
+            return PYNPUT_MAP[name]
+        if len(name) == 1:
+            return name.lower()
+        return None
+
+    def run_macro_steps(self, steps):
+        if not HAS_PYNPUT:
+            self.after(0, lambda: self.log(self.T("no_pynput")))
+            return
+        kb = _KbController()
+        for kind, val in steps:
+            if kind == "wait":
+                time.sleep(val / 1000.0)
+                continue
+            keys = [k for k in (self.py_key(n) for n in val) if k is not None]
+            if not keys:
+                continue
+            try:
+                for k in keys:
+                    kb.press(k)
+                time.sleep(0.012)
+                for k in reversed(keys):
+                    kb.release(k)
+            except Exception as ex:
+                err = str(ex)
+                self.after(0, lambda: self.log(self.T("macro_err", e=err)))
+                return
+
+    def execute_macro(self, spec):
+        steps, errors = parse_macro(spec)
+        if errors:
+            e = ", ".join(errors[:3])
+            self.after(0, lambda: self.log(self.T("macro_bad", e=e)))
+        if not steps:
+            return
+        self.run_macro_steps(steps)
+
+    def execute_text(self, txt):
+        if not txt:
+            return
+        if not HAS_PYNPUT:
+            self.after(0, lambda: self.log(self.T("no_pynput")))
+            return
+
+        def put_clip():
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(txt)
+            except Exception as ex:
+                err = str(ex)
+                self.after(0, lambda: self.log(self.T("clip_err", e=err)))
+                return
+
+            def paste():
+                time.sleep(0.05)
+                try:
+                    kb = _KbController()
+                    kb.press(_PKey.ctrl)
+                    kb.press("v")
+                    time.sleep(0.012)
+                    kb.release("v")
+                    kb.release(_PKey.ctrl)
+                except Exception as ex:
+                    err = str(ex)
+                    self.after(0, lambda: self.log(self.T("paste_err",
+                                                          e=err)))
+            threading.Thread(target=paste, daemon=True).start()
+
+        self.after(0, put_clip)
+
+    def execute_cmd(self, cmd):
+        if not cmd:
+            return
+        try:
+            subprocess.Popen(cmd, shell=True)
+            self.after(0, lambda: self.log(self.T("cmd_ok", c=cmd[:60])))
+        except Exception as ex:
+            err = str(ex)
+            self.after(0, lambda: self.log(self.T("cmd_err", e=err)))
+
+    def execute_app(self, c):
+        preset = APP_PRESETS.get(c.get("preset", ""))
+        procs = preset["proc"] if preset else \
+            [os.path.basename(c.get("path", "")).lower()]
+        mode = c.get("mode", "toggle")
+        path = c.get("path", "").strip()
+        args = c.get("args", "").strip()
+
+        if mode == "close":
+            n = kill_procs(procs)
+            if n:
+                self.after(0, lambda: self.log(self.T("closed_n", n=n)))
+            else:
+                self.after(0, lambda: self.log(self.T("not_found")))
+            return
+
+        running = find_proc(procs)
+        if mode == "focus" or (mode == "toggle" and running):
+            if running and self._focus_window(c, preset, running):
+                self.after(0, lambda: self.log(self.T("focus_ok")))
+                return
+            if running:
+                self.after(0, lambda: self.log(self.T("focus_retry")))
+        if not path:
+            self.after(0, lambda: self.log(self.T("path_missing")))
+            return
+        try:
+            subprocess.Popen(f'"{path}" {args}'.strip(), shell=True)
+            self.after(0, lambda: self.log(self.T("run_ok", p=path)))
+        except Exception as ex:
+            err = str(ex)
+            self.after(0, lambda: self.log(self.T("run_err", e=err)))
+
+    def _focus_window(self, c, preset, proc):
+        if not HAS_GW:
+            self.after(0, lambda: self.log(self.T("gw_missing")))
+            return False
+        kw = (preset or {}).get("win") or \
+            os.path.splitext(os.path.basename(c.get("path", "")))[0]
+        try:
+            wins = [w for w in gw.getWindowsWithTitle(kw) if w.title]
+            if not wins:
+                return False
+            wins[0].activate()
+            return True
+        except Exception as ex:
+            err = str(ex)
+            self.after(0, lambda: self.log(self.T("focus_err", e=err)))
+            return False
+
+    def execute_http(self, c):
+        url = c.get("url", "").strip()
+        method = c.get("method", "GET")
+        if not url:
+            return
+        try:
+            data = None
+            headers = {"User-Agent": "StreamDeckLauncher/9"}
+            if method == "POST":
+                body = c.get("body", "").strip()
+                if body:
+                    data = body.encode("utf-8")
+                    headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, method=method,
+                                         headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                code = resp.getcode()
+            self.after(0, lambda: self.log(self.T("http_ok", m=method,
+                                                  c=code)))
+        except urllib.error.HTTPError as ex:
+            code = ex.code
+            self.after(0, lambda: self.log(self.T("http_code", c=code)))
+        except Exception as ex:
+            err = str(ex)
+            self.after(0, lambda: self.log(self.T("http_err", e=err)))
+
+    def execute_vol(self, c):
+        result = sys_volume_step(c.get("mode", "up"))
+        self.after(0, lambda: self.log(self.T("vol_log", r=result)))
+
+    def execute_action(self, c):
+        t = c.get("type")
+        if t == "macro":
+            self.execute_macro(c.get("steps", ""))
+        elif t == "cmd":
+            self.execute_cmd(c.get("cmd", ""))
+        elif t == "text":
+            self.execute_text(c.get("txt", ""))
+        elif t == "app":
+            self.execute_app(c)
+        elif t == "http":
+            self.execute_http(c)
+        elif t == "vol":
+            self.execute_vol(c)
+
+    def test_macro(self):
+        self.commit_editor()
+        c = self.cfg["slots"][self.selected]
+        if not c.get("steps"):
+            messagebox.showwarning(self.T("macro_t"),
+                                   self.T("macro_empty_q"))
+            return
+        threading.Thread(target=self.execute_action, args=(deepcopy(c),),
+                         daemon=True).start()
+
+    def test_cmd(self):
+        self.commit_editor()
+        self.execute_cmd(self.cfg["slots"][self.selected].get("cmd", ""))
+
+    def test_app(self):
+        self.commit_editor()
+        c = self.cfg["slots"][self.selected]
+        if not (c.get("path") or APP_PRESETS.get(c.get("preset", ""),
+                                                 {}).get("path")):
+            messagebox.showwarning(self.T("app_t"), self.T("app_path_q"))
+            return
+        threading.Thread(target=self.execute_action, args=(deepcopy(c),),
+                         daemon=True).start()
+
+    def test_http(self):
+        self.commit_editor()
+        c = self.cfg["slots"][self.selected]
+        if not c.get("url"):
+            messagebox.showwarning(self.T("http_t"), self.T("url_q"))
+            return
+        threading.Thread(target=self.execute_action, args=(deepcopy(c),),
+                         daemon=True).start()
+
+    def test_obs_action(self):
+        if not self.obs_client:
+            messagebox.showwarning(self.T("obs_t"),
+                                   self.T("warn_obs_first"))
+            return
+        self.commit_editor()
+        code = self.obs_code(self.ed["action_cb"].get())
+        self.obs_execute(code, self.ed["param_cb"].get())
+
+    def show_stats(self):
+        stats = self.cfg.get("stats", {})
+        if not stats:
+            self.log(self.T("stats_empty"))
+            return
+        self.log(self.T("stats_hdr"))
+        for sid, n in sorted(stats.items(), key=lambda kv: -kv[1])[:10]:
+            self.log(f"{slot_title(sid, self.lang)}: {n}")
+
+    # ---------------- профили ----------------
+    def refresh_profiles(self):
+        names = sorted(self.cfg.get("profiles", {}).keys())
+        self.profile_cb.configure(values=names)
+        if names:
+            self.profile_cb.set(names[0])
+
+    def profile_save(self):
+        if self.selected and self.ed:
+            self.commit_editor()
+        dlg = ctk.CTkInputDialog(text=self.T("prof_name_q"),
+                                 title=self.T("prof_new_t"))
+        name = dlg.get_input()
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        self.cfg.setdefault("profiles", {})[name] = {
+            "slots": deepcopy(self.cfg["slots"]),
+            "bt_mode": self.bt_mode.get()}
+        self.save_config()
+        self.refresh_profiles()
+        self.profile_cb.set(name)
+        self.log(self.T("prof_saved", n=name))
+
+    def profile_load(self):
+        if self.selected and self.ed:
+            self.commit_editor()
+        name = self.profile_cb.get()
+        prof = self.cfg.get("profiles", {}).get(name)
+        if not prof:
+            messagebox.showwarning(self.T("profile_t"), self.T("prof_none"))
+            return
+        self.cfg["slots"] = deepcopy(prof.get("slots", self.cfg["slots"]))
+        self.bt_mode.set(prof.get("bt_mode", True))
+        self.save_config()
+        self.render_slot_list()
+        self.select_slot(self.selected or ALL_SLOTS[0])
+        self.log(self.T("prof_loaded", n=name))
+        messagebox.showinfo(self.T("profile_t"),
+                            self.T("prof_load_msg", n=name))
+
+    def profile_delete(self):
+        name = self.profile_cb.get()
+        if name and messagebox.askyesno(self.T("profile_t"),
+                                        self.T("prof_del_q", n=name)):
+            self.cfg.get("profiles", {}).pop(name, None)
+            self.save_config()
+            self.refresh_profiles()
+            self.log(self.T("prof_deleted", n=name))
+
+    # ---------------- импорт/экспорт ----------------
+    def config_export(self):
+        if self.selected and self.ed:
+            self.commit_editor()
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="streamdeck_config.json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+            self.log(self.T("exp_ok", p=path))
+        except Exception as ex:
+            messagebox.showerror(self.T("exp_t"),
+                                 self.T("exp_fail", e=ex))
+
+    def config_import(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as ex:
+            messagebox.showerror(self.T("imp_t"),
+                                 self.T("imp_fail", e=ex))
+            return
+        self.cfg["obs"].update(data.get("obs", {}))
+        self.cfg["slots"].update(data.get("slots", {}))
+        self.cfg.setdefault("profiles", {}).update(data.get("profiles", {}))
+        self.bt_mode.set(data.get("bt_mode", True))
+        for sid in ALL_SLOTS:
+            box = self.cfg["slots"].setdefault(
+                sid, deepcopy(DEFAULT_SLOTS.get(sid, {"type": "none"})))
+            if box.get("obs_action") in LEG_OBS:
+                box["obs_action"] = LEG_OBS[box["obs_action"]]
+            if box.get("type") == "app" and box.get("mode") in LEG_APP:
+                box["mode"] = LEG_APP[box["mode"]]
+            if box.get("type") == "vol" and box.get("mode") in LEG_VOL:
+                box["mode"] = LEG_VOL[box["mode"]]
+            if box.get("preset") in LEG_PRESET:
+                box["preset"] = LEG_PRESET[box["preset"]]
+        if data.get("lang") in STR:
+            self.lang = data["lang"]
+        self.obs_host.set(self.cfg["obs"]["host"])
+        self.obs_port.set(str(self.cfg["obs"]["port"]))
+        self.obs_pass.set(self.cfg["obs"]["password"])
+        self.save_config()
+        self.refresh_profiles()
+        self.render_slot_list()
+        self.select_slot(self.selected or ALL_SLOTS[0])
+        self.log(self.T("imp_log", p=path))
+        messagebox.showinfo(self.T("imp_t"), self.T("imp_ok"))
+
+    def log(self, msg):
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end",
+                                time.strftime("%H:%M:%S  ") + msg + "\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    # ---------------- Serial: работник сам переподключается ----------------
+    def refresh_ports(self):
+        if serial is None:
+            self.ser_status.configure(
+                text="pyserial" + self.T("cfg_fail", e="")[:0] +
+                     " not installed" if self.lang == "en" else
+                     "pyserial не установлен",
+                text_color=ERR_COLOR)
+            return
+        items = [(p.device, f"{p.device} — {p.description}")
+                 for p in list_ports.comports()]
+        self._ports = {name: dev for dev, name in items}
+        self.port_cb.configure(values=[name for _, name in items])
+        if items:
+            self.port_cb.set(items[0][1])
+
+    def _pick_port(self):
+        """Выбор порта: сначала прошлый, потом USB-Serial по описанию."""
+        try:
+            present = [p.device for p in list_ports.comports()]
+        except Exception:
+            return None
+        last = self.cfg.get("last_port", "")
+        if last and last in present:
+            return last
+        try:
+            for p in list_ports.comports():
+                desc = (p.description or "").lower()
+                if any(v in desc for v in SERIAL_VENDORS):
+                    return p.device
+        except Exception:
+            pass
+        return None
+
+    def open_port(self, port):
+        s = serial.Serial()
+        s.port = port
+        s.baudrate = 115200
+        s.timeout = 0.1
+        s.write_timeout = 1.0
+        s.dtr = False
+        s.rts = False
+        s.open()
+        # даём CH340 устаканиться и чистим мусор из буферов
+        time.sleep(0.25)
+        try:
+            s.reset_input_buffer()
+            s.reset_output_buffer()
+        except Exception:
+            pass
+        return s
+
+    def _serial_worker(self, port):
+        """Единственный поток, открывающий и закрывающий порт.
+        Сам переподключается после обрывов — до 6 попыток с паузой 2 с.
+        Watcher подключается только если этот поток вообще умер."""
+        retries = 0
+        try:
+            while not self._watcher_stop.is_set():
+                if self._manual_disconnect:
+                    return
+                try:
+                    ser = self.open_port(port)
+                except Exception as ex:
+                    retries += 1
+                    if retries == 1:
+                        self.rx_queue.put(
+                            ("serial_retry", f"{port}: {ex}"))
+                        _write_crash_log(f"[connect] open fail {port}: {ex}")
+                    if retries >= 6:
+                        self.rx_queue.put(
+                            ("serial_dead",
+                             self.T("serial_dead", p=port)))
+                        _write_crash_log(f"[connect] give up {port}")
+                        return
+                    self._watcher_stop.wait(2.0)
+                    continue
+
+                self.ser = ser
+                retries = 0
+                self.running = True
+                self.rx_queue.put(("serial_ok", port))
+                _write_crash_log(f"[connect] opened {port}")
+
+                buf = b""
+                lost = None
+                while self.running and not self._manual_disconnect:
+                    try:
+                        n = ser.in_waiting
+                        data = ser.read(n if n else 1)
+                    except Exception as ex:
+                        lost = f"read fail: {ex}"
+                        _write_crash_log(f"[connect] read fail: {ex}")
+                        break
+                    if not data:
+                        continue
+                    buf += data
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        line = raw.decode("utf-8", "ignore").strip()
+                        if not line:
+                            continue
+                        if line.startswith("TRIG "):
+                            self.rx_queue.put(("trig", line[5:].strip()))
+                        elif line.startswith("INFO "):
+                            self.rx_queue.put(("info", line[5:].strip()))
+                        else:
+                            self.reply_q.put(line)
+
+                # закрываем порт здесь же, в этом потоке
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                if lost and self.running and not self._manual_disconnect:
+                    self.running = False
+                    self.rx_queue.put(("serial_retry", lost))
+                if self._manual_disconnect or self._watcher_stop.is_set():
+                    return
+                self._watcher_stop.wait(2.0)
+        except Exception as ex:
+            _write_crash_log("[worker] " + str(ex))
+        finally:
+            self.running = False
+
+    def serial_connect(self, port, quiet=False):
+        self._manual_disconnect = False
+        if self.conn_thread and self.conn_thread.is_alive():
+            self.running = False
+            self.conn_thread.join(timeout=2.0)
+        self.ser = None
+        self.ser_status.configure(text=self.T("ser_try"),
+                                  text_color=IDLE_COLOR)
+        self.conn_thread = threading.Thread(
+            target=self._serial_worker, args=(port,), daemon=True)
+        self.conn_thread.start()
+        return True
+
+    def manual_connect(self):
+        if self.busy:
+            return
+        port = self._ports.get(self.port_cb.get(),
+                               self.port_cb.get().split(" — ")[0])
+        if not port:
+            messagebox.showwarning(self.T("err_serial"),
+                                   self.T("warn_port"))
+            return
+        self.serial_connect(port, quiet=False)
+
+    def auto_connect_now(self):
+        port = self._pick_port()
+        if not port:
+            messagebox.showerror(self.T("err_find_t"), self.T("err_find"))
+            return
+        self.serial_connect(port, quiet=False)
+
+    def _watcher_loop(self):
+        """Поднимает связь, только если работник совсем умер."""
+        while not self._watcher_stop.wait(3.0):
+            if self.running or self.busy or serial is None:
+                continue
+            if not self.cfg.get("auto_connect", True):
+                continue
+            if self._manual_disconnect:
+                continue
+            alive = self.conn_thread is not None and \
+                self.conn_thread.is_alive()
+            if alive:
+                continue
+            port = self._pick_port()
+            if port:
+                self.rx_queue.put(("watch_try", port))
+
+    def serial_disconnect(self):
+        self._manual_disconnect = True
+        self.running = False
+        self.after(200, self._finalize_disconnect)
+
+    def _finalize_disconnect(self):
+        t = self.conn_thread
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+        self.ser = None
+        self.ser_status.configure(text=self.T("ser_nc"),
+                                  text_color=ERR_COLOR)
+        self.ser_status2.configure(text="Serial: —", text_color=IDLE_COLOR)
+        self.ble_status.configure(text="BLE: —", text_color=IDLE_COLOR)
+
+    def _drain_reply(self):
+        try:
+            while True:
+                self.reply_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def request(self, line, stops, timeout=2.0):
+        if not self.ser or not self.running:
+            return None
+        self._drain_reply()
+        try:
+            with self.io_lock:
+                self.ser.write((line + "\n").encode("utf-8"))
+        except Exception:
+            return None
+        lines, deadline = [], time.time() + timeout
+        while time.time() < deadline:
+            try:
+                ln = self.reply_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            lines.append(ln)
+            if any(ln.startswith(s) for s in stops):
+                return lines
+        return lines or None
+
+    def poll_rx(self):
+        try:
+            while True:
+                kind, payload = self.rx_queue.get_nowait()
+                if kind == "trig":
+                    self.on_trigger(payload)
+                elif kind == "info":
+                    if payload.startswith("ble="):
+                        on = payload.split("ble=")[-1].strip() == "1"
+                        self.ble_status.configure(
+                            text=self.T("ble_on") if on
+                            else self.T("ble_wait"),
+                            text_color=OK_COLOR if on else IDLE_COLOR)
+                elif kind == "serial_ok":
+                    port = payload
+                    self.cfg["last_port"] = port
+                    self.save_config()
+                    self.ser_status.configure(
+                        text=self.T("ser_ok", p=port),
+                        text_color=OK_COLOR)
+                    self.ser_status2.configure(text=f"Serial: {port}",
+                                               text_color=OK_COLOR)
+                    self.log(self.T("log_connected", p=port))
+                elif kind == "serial_retry":
+                    self.ser_status.configure(text=self.T("ser_retry"),
+                                              text_color=IDLE_COLOR)
+                    self.log(self.T("log_lost", e=payload))
+                elif kind == "serial_dead":
+                    self.ser_status.configure(text=self.T("ser_nc"),
+                                              text_color=ERR_COLOR)
+                    self.ser_status2.configure(text="Serial: —",
+                                               text_color=IDLE_COLOR)
+                    self.log(payload)
+                elif kind == "watch_try":
+                    alive = self.conn_thread is not None and \
+                        self.conn_thread.is_alive()
+                    if not alive and not self.running \
+                            and not self._manual_disconnect:
+                        self.log(self.T("log_watch", p=payload))
+                        self.serial_connect(payload, quiet=True)
+        except queue.Empty:
+            pass
+        self.after(50, self.poll_rx)
+
+    def flash(self, sid):
+        btn = self.list_buttons.get(sid)
+        if not btn:
+            return
+        btn.configure(fg_color=FLASH_BG)
+        if self.selected == sid:
+            self.ed_card.configure(border_color=FLASH_COLOR)
+        if sid in self.flash_timers:
+            self.after_cancel(self.flash_timers[sid])
+        self.flash_timers[sid] = self.after(250, self._unflash, sid)
+
+    def _unflash(self, sid):
+        btn = self.list_buttons.get(sid)
+        if btn:
+            sel_now = (self.selected == sid)
+            btn.configure(fg_color=SEL_BG if sel_now else "transparent")
+        if self.selected == sid:
+            self.ed_card.configure(border_color=BORDER_SEL)
+
+    def on_trigger(self, sid):
+        self.flash(sid)
+        stats = self.cfg.setdefault("stats", {})
+        stats[sid] = stats.get(sid, 0) + 1
+        self.save_config()
+        if self.test_mode.get():
+            self.log(self.T("test_log", s=slot_title(sid, self.lang)))
+            return
+        c = self.cfg["slots"].get(sid, {})
+        t = c.get("type")
+        if t == "obs" and not self.bt_mode.get() and self.obs_client:
+            self.obs_execute(c.get("obs_action", "scene"),
+                             c.get("obs_param", ""))
+        elif t in ("macro", "cmd", "text", "app", "http", "vol"):
+            threading.Thread(target=self.execute_action, args=(deepcopy(c),),
+                             daemon=True).start()
+        # keys/media исполняет сама плата
+
+    # ---------------- запись конфига ----------------
+    def push_config(self):
+        if not self.ser or not self.running:
+            messagebox.showwarning(self.T("err_serial"),
+                                   self.T("warn_conn_first"))
+            return
+        if self.busy:
+            return
+        if self.selected and self.ed:
+            self.commit_editor()
+        try:
+            port = int(self.obs_port.get() or 4455)
+        except ValueError:
+            port = 4455
+        self.cfg["obs"] = {"host": self.obs_host.get(),
+                           "port": port,
+                           "password": self.obs_pass.get()}
+        self.cfg["bt_mode"] = self.bt_mode.get()
+        self.busy = True
+        self.push_btn.configure(state="disabled", text=self.T("pushing"))
+        threading.Thread(target=self._push_worker, daemon=True).start()
+
+    def _push_worker(self):
+        try:
+            specs, hints, obs_n = {}, [], 0
+            for sid in ALL_SLOTS:
+                c = self.cfg["slots"][sid]
+                t = c["type"]
+                if t == "keys":
+                    specs[sid] = "KEYS:" + "+".join(
+                        c.get("mods", []) + [c["key"]])
+                elif t == "media":
+                    specs[sid] = "MEDIA:" + c.get("media", "PLAY")
+                elif t == "obs":
+                    if self.bt_mode.get():
+                        obs_n += 1
+                        digit = str(obs_n) if obs_n <= 9 else "0"
+                        specs[sid] = f"KEYS:CTRL+ALT+SHIFT+{digit}"
+                        hints.append(
+                            f"{slot_title(sid, self.lang)}: "
+                            f"CTRL+ALT+SHIFT+{digit}")
+                    else:
+                        specs[sid] = "OBS"
+                else:
+                    specs[sid] = "NONE"
+
+            items = list(specs.items())
+            for i in range(0, len(items), BLOCK_SIZE):
+                block = items[i:i + BLOCK_SIZE]
+                for sid, spec in block:
+                    try:
+                        with self.io_lock:
+                            self.ser.write(
+                                f"SET {sid} {spec}\n".encode("utf-8"))
+                    except Exception as ex:
+                        e = str(ex)
+                        self.after(0, lambda: messagebox.showerror(
+                            self.T("err_esp32"),
+                            self.T("port_closed", e=e)))
+                        return
+                for sid, _ in block:
+                    deadline = time.time() + 1.5
+                    ok = False
+                    while time.time() < deadline:
+                        try:
+                            ln = self.reply_q.get(timeout=0.05)
+                        except queue.Empty:
+                            continue
+                        if ln.startswith("OK "):
+                            ok = True
+                            break
+                        if ln.startswith("ERR"):
+                            e = ln
+                            self.after(0, lambda: messagebox.showerror(
+                                self.T("err_esp32"),
+                                self.T("slot_err", s=sid, e=e)))
+                            return
+                    if not ok:
+                        self.after(0, lambda: messagebox.showerror(
+                            self.T("err_esp32"),
+                            self.T("slot_ack", s=sid)))
+                        return
+
+            resp = self.request("APPLY", stops=("OK APPLY",))
+            if not (resp and any(r.startswith("OK APPLY") for r in resp)):
+                self.after(0, lambda: messagebox.showerror(
+                    self.T("err_esp32"), self.T("apply_err")))
+                return
+
+            self.save_config()
+            self.after(0, lambda: self._push_done(hints))
+        except Exception as ex:
+            err = str(ex)
+            self.after(0, lambda: self.log(f"[push] {err}"))
+        finally:
+            self.after(0, self._push_unlock)
+
+    def _push_unlock(self):
+        self.busy = False
+        self.push_btn.configure(state="normal", text=self.T("push"))
+
+    def _push_done(self, hints):
+        self.log(self.T("push_ok"))
+        if hints:
+            messagebox.showinfo(
+                self.T("done"),
+                self.T("push_msg_hdr") + "\n".join(hints) +
+                self.T("push_msg_tip"))
+        else:
+            messagebox.showinfo(self.T("done"), self.T("push_done"))
+
+    def read_from_device(self):
+        if not self.ser or not self.running:
+            messagebox.showwarning(self.T("err_serial"),
+                                   self.T("warn_conn_first"))
+            return
+        resp = self.request("LIST", stops=("OK LIST",), timeout=3.0)
+        if not resp:
+            self.log(self.T("list_fail"))
+            return
+        self.log(self.T("list_hdr"))
+        for ln in resp:
+            if ln.startswith("SLT "):
+                self.log(ln[4:])
+
+    def reset_device(self):
+        if not self.ser or not self.running:
+            messagebox.showwarning(self.T("err_serial"),
+                                   self.T("warn_conn_first"))
+            return
+        if messagebox.askyesno(self.T("reset_t"), self.T("reset_q")):
+            self.request("RESET", stops=("OK RESET",))
+            self.log(self.T("reset_ok"))
+            messagebox.showinfo(self.T("done"), self.T("reset_ok"))
+
+    # ---------------- OBS ----------------
+    def obs_connect(self):
+        if obs is None:
+            messagebox.showerror(self.T("obs_t"), self.T("obs_lib"))
+            return
+        try:
+            port = int(self.obs_port.get() or 4455)
+        except ValueError:
+            port = 4455
+        try:
+            cl = obs.ReqClient(host=self.obs_host.get().strip() or "localhost",
+                               port=port,
+                               password=self.obs_pass.get(), timeout=3)
+            scenes = cl.get_scene_list()
+            inputs = cl.get_input_list()
+            self.obs_client = cl
+            self.obs_scenes = [s.scene_name for s in scenes.scenes]
+            self.obs_inputs = [i.input_name for i in inputs.inputs]
+            self.obs_status.configure(text=self.T("obs_ok"),
+                                      text_color=OK_COLOR)
+            self.log(self.T("obs_log", s=len(self.obs_scenes),
+                            i=len(self.obs_inputs)))
+            if self.ed.get("action_cb") is not None:
+                code = self.obs_code(self.ed["action_cb"].get())
+                self.ed["param_cb"].configure(values=self.param_values(code))
+        except Exception as ex:
+            messagebox.showerror(self.T("obs_t"),
+                                 self.T("obs_fail", e=ex))
+
+    def obs_execute(self, action_code, param):
+        cl = self.obs_client
+
+        def run():
+            with self.obs_lock:
+                try:
+                    if action_code == "scene" and param:
+                        cl.set_current_program_scene(param)
+                    elif action_code == "stream":
+                        if cl.get_stream_status().output_active:
+                            cl.stop_stream()
+                        else:
+                            cl.start_stream()
+                    elif action_code == "record":
+                        cl.toggle_record()
+                    elif action_code == "mute_src" and param:
+                        cl.toggle_input_mute(param)
+                    elif action_code == "transition":
+                        cl.trigger_studio_mode_transition()
+                    elif action_code == "replay":
+                        cl.save_replay_buffer()
+                except Exception as ex:
+                    err = str(ex)
+                    self.after(0, lambda: self.log(self.T("obs_err_log",
+                                                          e=err)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_close(self):
+        if self.selected and self.ed:
+            try:
+                self.commit_editor()
+            except Exception:
+                pass
+        self.save_config()
+        self.running = False
+        self._watcher_stop.set()
+        try:
+            self._finalize_disconnect()
+        except Exception:
+            pass
+        if self.obs_client:
+            try:
+                self.obs_client.disconnect()
+            except Exception:
+                pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = StreamDeckApp()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
